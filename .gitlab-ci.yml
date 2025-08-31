@@ -1,0 +1,182 @@
+# .gitlab-ci.yml
+stages:
+  - prepare
+  - test
+  - build
+  - deploy
+  - verify
+  - rollback
+
+# default:
+#   tags: ["runner4"]          # pakai runner lokal staging
+#   interruptible: true
+#   cache:
+#     key: ${CI_COMMIT_REF_SLUG}
+#     paths:
+#       - vendor/
+#       - node_modules/
+#   artifacts:
+#     when: always
+#     expire_in: 7 days
+
+
+variables:
+  REPO: $REGISTRY_URL/nashtanet/$APP_NAME
+  CERT_DIR: /etc/docker/certs.d/$REGISTRY_URL
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - vendor/
+    - node_modules/
+
+
+# ---- 1) PREPARE: composer & node deps, seed env testing ----
+prepare:
+  stage: prepare
+  image: php:7.4-fpm
+  only:
+    - main
+  tags:
+    - runner4
+  before_script:
+    - apt-get update && apt-get install -y git unzip libzip-dev libicu-dev zlib1g-dev libpng-dev
+    - docker-php-ext-install intl zip gd
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - php -v && composer -V
+  script:
+    - echo "${ENV}" > .env
+    - composer install --prefer-dist --no-ansi --no-interaction --no-progress
+    - php artisan key:generate
+    # optional: bila butuh asset build minimal
+    - apt-get install -y nodejs npm
+    - npm ci || npm install
+  artifacts:
+    expire_in: 1 hour
+    paths:
+      - vendor/
+      - node_modules/
+      - .env
+
+# ---- 2) TEST: PHPUnit + Coverage ----
+unit_test:
+  stage: test
+  image: php:7.4-cli
+  only:
+    - main
+  tags:
+    - runner4
+  coverage: '/^\s*Lines:\s*\d+.\d+\%/'
+  before_script:
+    - apt-get update && apt-get install -y git unzip libzip-dev libicu-dev zlib1g-dev libxml2-utils
+    - docker-php-ext-install intl zip
+    # Install Xdebug 2.9.8
+    - pecl install xdebug-2.9.8
+    - docker-php-ext-enable xdebug
+    - echo "zend_extension=$(php -r 'echo ini_get(\"extension_dir\");')/xdebug.so" > /usr/local/etc/php/conf.d/xdebug.ini
+    - echo "xdebug.coverage_enable=1" >> /usr/local/etc/php/conf.d/xdebug.ini
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - echo "${ENV}" > .env
+    - cat .env
+    - composer install --prefer-dist --no-ansi --no-interaction --no-progress
+    - php artisan key:generate
+    # Debug cek xdebug
+    - php -v
+    - php -m | grep xdebug
+  script:
+    - ./vendor/bin/phpunit --log-junit junit.xml --coverage-text --coverage-clover coverage.xml
+  artifacts:
+    reports:
+      junit: junit.xml
+    expire_in: 1 hour
+    paths:
+      - coverage.xml
+      - junit.xml
+
+# ---- 3) BUILD: Docker image push ke GitLab Container Registry ----
+build:
+  stage: build
+  image: ${DOCKER_IMAGE}
+  only:
+    - main
+  tags:
+    - runner4
+  before_script:
+    - echo "build image to harbor started."
+  script:
+    - echo "${ENV}" > .env
+    - ls
+    - mkdir -p $CERT_DIR
+    - chmod 755 $CERT_DIR
+    - echo "$REGISTRY_CERT" | tr -d '\r' > $REGISTRY_URL.cert
+    - echo "$REGISTRY_KEY" | tr -d '\r' > $REGISTRY_URL.key
+    - echo "$REGISTRY_CA" | tr -d '\r' > ca.crt
+    - cp $REGISTRY_URL.cert $REGISTRY_URL.key ca.crt $CERT_DIR
+    - echo "$REGISTRY_SECRET" | docker login --username "$REGISTRY_USER" https://"$REGISTRY_URL" --password-stdin
+    - docker build -t "$REPO":"$CI_COMMIT_SHORT_SHA" .
+    - docker push "$REPO":"$CI_COMMIT_SHORT_SHA"
+  after_script:
+    - echo "build image to harbor done."
+
+# ---- 4) DEPLOY: apply manifest K8s (rolling update), healthcheck ----
+deploy:
+  stage: deploy
+  image: ${K8S_IMAGE}
+  only:
+    - main
+  tags:
+    - runner4
+  before_script:
+    - echo "deploying app started"
+  script:
+    - mkdir -p ~/.kube
+    - echo "$K8S_CONFIG_DEV" > ~/.kube/config
+    - kubectl get pods -n default
+    - kubectl set image deployment ${APP_NAME} ${APP_NAME}=${REPO}:${CI_COMMIT_SHORT_SHA} -n default --record
+  after_script:
+    - echo "deploying app done"
+
+# ---- 5) VERIFY/PERF: k6 smoke/perf test terhadap endpoint staging; gagal => pipeline fail ----
+verify:
+  stage: verify
+  image:
+    name: grafana/k6:latest
+    entrypoint: [""]
+  only:
+    - main
+  tags:
+    - runner4
+  script:
+    - k6 run --out json=k6/k6-result.json k6/script.js
+  artifacts:
+    expire_in: 1 hour
+    paths:
+      - k6/k6-result.json
+
+# ---- 6) ROLLBACK: otomatis saat stage deploy/verify gagal ----
+rollback:
+  stage: rollback
+  image: ${K8S_IMAGE}   # contoh: bitnami/kubectl:1.30
+  only:
+    - main
+  tags:
+    - runner4
+  needs:
+    # - job: deploy
+    #   optional: true
+    - job: verify
+      optional: true
+  when: on_failure   # rollback hanya jalan kalau verify gagal
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - echo "Rollback Started"
+  script:
+    - echo "Rolling back ${APP_NAME} in namespace default..."
+    - mkdir -p ~/.kube
+    - echo "$K8S_CONFIG_DEV" > ~/.kube/config
+    - kubectl get deployment -n default
+    - kubectl -n default rollout undo deploy/${APP_NAME}
+    - kubectl -n default rollout status deploy/${APP_NAME} --timeout=5m
+  after_script:
+    - echo "Rollback Done"
