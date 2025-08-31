@@ -8,7 +8,7 @@ stages:
   - rollback
 
 # default:
-#   tags: ["runner4"]          # pakai runner lokal staging
+#   tags: ["runner-staging"]          # pakai runner lokal staging
 #   interruptible: true
 #   cache:
 #     key: ${CI_COMMIT_REF_SLUG}
@@ -38,7 +38,7 @@ prepare:
   only:
     - main
   tags:
-    - runner4
+    - runner-staging
   before_script:
     - apt-get update && apt-get install -y git unzip libzip-dev libicu-dev zlib1g-dev libpng-dev
     - docker-php-ext-install intl zip gd
@@ -65,7 +65,7 @@ unit_test:
   only:
     - main
   tags:
-    - runner4
+    - runner-staging
   coverage: '/^\s*Lines:\s*\d+.\d+\%/'
   before_script:
     - apt-get update && apt-get install -y git unzip libzip-dev libicu-dev zlib1g-dev libxml2-utils
@@ -100,7 +100,7 @@ build:
   only:
     - main
   tags:
-    - runner4
+    - runner-staging
   before_script:
     - echo "build image to harbor started."
   script:
@@ -125,7 +125,7 @@ deploy:
   only:
     - main
   tags:
-    - runner4
+    - runner-staging
   before_script:
     - echo "deploying app started"
   script:
@@ -145,7 +145,7 @@ verify:
   only:
     - main
   tags:
-    - runner4
+    - runner-staging
   script:
     - k6 run --out json=k6/k6-result.json k6/script.js
   artifacts:
@@ -160,7 +160,7 @@ rollback:
   only:
     - main
   tags:
-    - runner4
+    - runner-staging
   needs:
     # - job: deploy
     #   optional: true
